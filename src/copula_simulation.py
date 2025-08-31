@@ -1,46 +1,22 @@
 "python src/copula_simulation.py fit --std_resids data/processed/std_resids.csv --copula_type rvine --output models/best_copula.json"
-"python src/copula_simulation.py simulate --copula models/best_copula.json --std_resids data/processed/std_resids.csv --n_sim 10000 --output data/processed/simulated_copula_samples.csv"
+"python src/copula_simulation.py simulate --copula models/best_copula.json --std_resids data/processed/std_resids.csv --n_sim 10000 --output data/processed/simulated_copula.csv"
+"python src/copula_simulation.py analyze --sim_csv data/processed/simulated_copula.csv --real_csv data/processed/std_resids.csv"
 
 import numpy as np
 import pandas as pd
 import pickle
 import pyvinecopulib as pv
 from scipy.stats import rankdata
+import os
 
 # Fit copula and save model
 def fit_copula_and_save(std_resids_path, copula_type='student', out_path='models/best_copula.json'):
     """
     Fit copula (student, gaussian, clayton, gumbel) từ standardized residuals và lưu model ra file pickle.
     """
-    from scipy.stats import rankdata
     df = pd.read_csv(std_resids_path, index_col=0)
     u = df.apply(lambda x: rankdata(x, method='average') / (len(x) + 1), axis=0)
-    # Fit bivariate copula for each pair using pyvinecopulib.Bicop
-    if copula_type in ['gaussian', 'clayton', 'gumbel', 'frank', 'student']:
-        os.makedirs(os.path.dirname(out_path), exist_ok=True)
-        tickers = u.columns.tolist()
-        n = len(tickers)
-        # Map copula_type to pyvinecopulib family (try attribute, fallback to int)
-        family_map = {}
-        family_int = {'gaussian': 1, 'student': 2, 'clayton': 3, 'gumbel': 4, 'frank': 5}
-        for k in family_int:
-            try:
-                family_map[k] = getattr(pv.BicopFamily, k)
-            except Exception:
-                family_map[k] = family_int[k]
-        for i in range(n):
-            for j in range(i+1, n):
-                x = u.iloc[:, i].to_numpy()
-                y = u.iloc[:, j].to_numpy()
-                data = np.column_stack((x, y))
-                copula = pv.Bicop(family=family_map[copula_type])
-                copula.fit(data)
-                fname = f'{copula_type}_{tickers[i]}_{tickers[j]}.pkl'
-                fpath = os.path.join(os.path.dirname(out_path), fname)
-                with open(fpath, 'wb') as f:
-                    pickle.dump(copula, f)
-                print(f"Fitted {copula_type} copula for {tickers[i]}-{tickers[j]} and saved to {fpath}")
-    elif copula_type == 'rvine':
+    if copula_type == 'rvine':
         import pyvinecopulib as pv
         if not out_path.endswith('.json'):
             raise ValueError('For copula_type rvine, output file must have .json extension')
@@ -49,30 +25,26 @@ def fit_copula_and_save(std_resids_path, copula_type='student', out_path='models
         try:
             family_set = [
                 getattr(pv.BicopFamily, 'gaussian', 1),
+                getattr(pv.BicopFamily, 'student', 2),
                 getattr(pv.BicopFamily, 'clayton', 3),
                 getattr(pv.BicopFamily, 'gumbel', 4),
-                getattr(pv.BicopFamily, 'frank', 5),
-                getattr(pv.BicopFamily, 'student', 2)
+                getattr(pv.BicopFamily, 'frank', 5)
             ]
         except Exception:
-            family_set = [1, 3, 4, 5, 2]
+            family_set = [1, 3, 4, 5]
         controls = pv.FitControlsVinecop(family_set=family_set)
-        # Fit R-vine copula using select method (for pyvinecopulib < 0.6)
         vine = pv.Vinecop(u_np.shape[1])
         vine.select(u_np, controls=controls)
-        # Save as JSON for pyvinecopulib
         out_json = out_path if out_path.endswith('.json') else out_path.rsplit('.', 1)[0] + '.json'
         json_str = vine.to_json()
         with open(out_json, 'w') as f:
             f.write(json_str)
         print(f"Fitted R-vine copula (pyvinecopulib) and saved to {out_json}")
     else:
-        raise ValueError('copula_type must be one of: vine_student, vine_gaussian, gaussian, clayton, gumbel, rvine')
+        raise NotImplementedError('Chỉ hỗ trợ xuất file json cho copula_type=rvine với pyvinecopulib.')
 
 
 # Hàm tạo hàm nghịch đảo CDF (quantile function) từ standardized residuals
-from scipy.stats import rankdata
-
 def empirical_ppf(series):
     """
     Trả về hàm nghịch đảo CDF thực nghiệm (empirical quantile function) cho 1 chuỗi dữ liệu.
@@ -91,11 +63,12 @@ def load_copula_and_marginals(copula_path, std_resids_path):
     """
     Load copula model và tạo dict các marginal quantile function từ standardized residuals.
     """
-    import os
-    import pyvinecopulib as pv
     # If loading a pyvinecopulib R-vine model, use from_json
     if copula_path.endswith('.json'):
-        best_copula_model = pv.Vinecop.from_json(copula_path)
+        # Đọc nội dung JSON từ file rồi mới parse
+        with open(copula_path, 'r', encoding='utf-8') as f:
+            json_str = f.read()
+        best_copula_model = pv.Vinecop.from_json(json_str)
     else:
         with open(copula_path, 'rb') as f:
             best_copula_model = pickle.load(f)
@@ -104,7 +77,7 @@ def load_copula_and_marginals(copula_path, std_resids_path):
     return best_copula_model, marginals
 
 
-def simulate_copula_portfolio(best_copula_model, marginals, n_sim=10000, random_state=None):
+def simulate_copula_portfolio(best_copula_model, marginals, n_sim=10000, random_state=None, output_path=None):
     """
     Sinh mẫu đồng thời từ copula đã fit và các marginal distribution.
     Args:
@@ -112,6 +85,7 @@ def simulate_copula_portfolio(best_copula_model, marginals, n_sim=10000, random_
         marginals: dict {ticker: inverse_cdf function} cho từng tài sản
         n_sim: số lượng mô phỏng
         random_state: seed
+        output_path: đường dẫn file để lưu kết quả (nếu có)
     Returns:
         DataFrame các giá trị mô phỏng (shape: n_sim x n_assets)
     """
@@ -138,15 +112,7 @@ def simulate_copula_portfolio(best_copula_model, marginals, n_sim=10000, random_
         sim_data[:, i] = marginals[ticker](u[:, i])
     df_sim = pd.DataFrame(sim_data, columns=tickers)
     # Nếu có output_path thì lưu luôn ra file CSV
-    import inspect
-    output_path = None
-    try:
-        frame = inspect.currentframe().f_back
-        output_path = frame.f_locals.get('output', None)
-    except Exception:
-        output_path = None
     if output_path is not None:
-        import os
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         df_sim.to_csv(output_path, index=False)
         print(f"Simulated samples saved to: {output_path}")
@@ -259,7 +225,7 @@ def main():
         print(f"Loading standardized residuals from: {args.std_resids}")
         best_copula_model, marginals = load_copula_and_marginals(args.copula, args.std_resids)
         print(f"Simulating {args.n_sim} samples...")
-        simulate_copula_portfolio(best_copula_model, marginals, n_sim=args.n_sim)
+        simulate_copula_portfolio(best_copula_model, marginals, n_sim=args.n_sim, output_path=args.output)
     elif args.command == 'analyze':
         comprehensive_analysis(args.sim_csv, real_csv_path=args.real_csv, alpha=args.alpha, out_dir=args.out_dir)
     else:
