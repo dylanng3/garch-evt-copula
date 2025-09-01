@@ -1,3 +1,5 @@
+"python src/data_prep.py --raw_folder data/raw --processed_folder data/processed"
+
 import os
 import pandas as pd
 import numpy as np
@@ -99,6 +101,10 @@ def main_data_prep(raw_folder: str, processed_folder: str, dropna_type: str = 'a
     logret_path = os.path.join(processed_folder, 'log_returns.csv')
     save_to_csv(log_returns, logret_path)
     print(f"Saved log returns to {logret_path}")
+    # Save the original date index 
+    logret_index_path = os.path.join(processed_folder, 'log_returns_index.csv')
+    log_returns.index.to_series().to_csv(logret_index_path, header=True)
+    print(f"Saved log returns index to {logret_index_path}")
     print("Data preparation pipeline completed.")
     
     # Add CLI entry point

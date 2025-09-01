@@ -1,5 +1,6 @@
-"python src/copula_simulation.py fit --std_resids data/processed/std_resids.csv --copula_type rvine --output models/best_copula.json"
-"python src/copula_simulation.py simulate --copula models/best_copula.json --std_resids data/processed/std_resids.csv --n_sim 10000 --output data/processed/simulated_copula.csv"
+"python src/copula_simulation.py fit --std_resids data/processed/std_resids.csv --output models/best_copula.json"
+# NOTE: The copula fitting now uses conditional PIT (from data/processed/conditional_pit.pkl) for U, not rank transform.
+"python src/copula_simulation.py simulate --copula models/best_copula.json --std_resids data/processed/std_resids.csv --evt_params data/processed/evt_results.pkl --n_sim 10000 --output data/processed/simulated_copula.csv"
 "python src/copula_simulation.py analyze --sim_csv data/processed/simulated_copula.csv --real_csv data/processed/std_resids.csv"
 
 import numpy as np
@@ -8,64 +9,86 @@ import pickle
 import pyvinecopulib as pv
 from scipy.stats import rankdata
 import os
+import json
 
 # Fit copula and save model
-def fit_copula_and_save(std_resids_path, copula_type='student', out_path='models/best_copula.json'):
+def fit_copula_and_save(std_resids_path, out_path='models/best_copula.json'):
     """
-    Fit copula (student, gaussian, clayton, gumbel) từ standardized residuals và lưu model ra file pickle.
+    Fit R-vine copula từ standardized residuals và lưu model ra file json.
     """
     df = pd.read_csv(std_resids_path, index_col=0)
-    u = df.apply(lambda x: rankdata(x, method='average') / (len(x) + 1), axis=0)
-    if copula_type == 'rvine':
-        import pyvinecopulib as pv
-        if not out_path.endswith('.json'):
-            raise ValueError('For copula_type rvine, output file must have .json extension')
-        os.makedirs(os.path.dirname(out_path), exist_ok=True)
-        u_np = u.values
-        try:
-            family_set = [
-                getattr(pv.BicopFamily, 'gaussian', 1),
-                getattr(pv.BicopFamily, 'student', 2),
-                getattr(pv.BicopFamily, 'clayton', 3),
-                getattr(pv.BicopFamily, 'gumbel', 4),
-                getattr(pv.BicopFamily, 'frank', 5)
-            ]
-        except Exception:
-            family_set = [1, 3, 4, 5]
-        controls = pv.FitControlsVinecop(family_set=family_set)
-        vine = pv.Vinecop(u_np.shape[1])
-        vine.select(u_np, controls=controls)
-        out_json = out_path if out_path.endswith('.json') else out_path.rsplit('.', 1)[0] + '.json'
-        json_str = vine.to_json()
-        with open(out_json, 'w') as f:
-            f.write(json_str)
-        print(f"Fitted R-vine copula (pyvinecopulib) and saved to {out_json}")
-    else:
-        raise NotImplementedError('Chỉ hỗ trợ xuất file json cho copula_type=rvine với pyvinecopulib.')
+    # Load conditional PIT
+    with open('data/processed/conditional_pit.pkl', 'rb') as f:
+        pit_dict = pickle.load(f)
+    # Align PIT to df index and columns
+    pit_df = pd.DataFrame({k: pd.Series(v, index=df.index) for k, v in pit_dict.items()})
+    pit_df = pit_df[df.columns]  # Ensure column order matches
+    u = pit_df.values
+    import pyvinecopulib as pv
+    if not out_path.endswith('.json'):
+        raise ValueError('Output file must have .json extension')
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    try:
+        family_set = [
+            getattr(pv.BicopFamily, 'gaussian', 1),
+            getattr(pv.BicopFamily, 'student', 2),
+            getattr(pv.BicopFamily, 'clayton', 3),
+            getattr(pv.BicopFamily, 'gumbel', 4),
+            getattr(pv.BicopFamily, 'frank', 5)
+        ]
+    except Exception:
+        family_set = [1, 3, 4, 5]
+    controls = pv.FitControlsVinecop(family_set=family_set)
+    vine = pv.Vinecop(u.shape[1])
+    vine.select(u, controls=controls)
+    out_json = out_path if out_path.endswith('.json') else out_path.rsplit('.', 1)[0] + '.json'
+    json_str = vine.to_json()
+    with open(out_json, 'w') as f:
+        f.write(json_str)
+    print(f"Fitted R-vine copula (pyvinecopulib) and saved to {out_json}")
 
 
 # Hàm tạo hàm nghịch đảo CDF (quantile function) từ standardized residuals
-def empirical_ppf(series):
-    """
-    Trả về hàm nghịch đảo CDF thực nghiệm (empirical quantile function) cho 1 chuỗi dữ liệu.
-    """
-    sorted_vals = np.sort(series)
+def hybrid_ppf(sample, left_params, right_params, qL=0.95, qU=0.95):
+    sorted_vals = np.sort(sample)
+    n = len(sorted_vals)
+    xL = np.quantile(sorted_vals, 1 - qL)
+    xU = np.quantile(sorted_vals, qU)
+    thL, shapeL, scaleL = left_params
+    thR, shapeR, scaleR = right_params
+
+    def gpd_ppf(q, shape, scale):
+        # q in (0,1) for GPD
+        return scale * (q ** (-shape) - 1) / shape if abs(shape) > 1e-8 else scale * np.log(1.0 / q)
+
     def ppf(q):
-        # q: array-like, các giá trị trong [0,1]
-        idx = (q * (len(sorted_vals)-1)).astype(int)
-        return sorted_vals[idx]
+        q = np.asarray(q)
+        out = np.empty_like(q, dtype=float)
+        # Center
+        mask_mid = (q >= (1 - qL)) & (q <= qU)
+        idx = (q[mask_mid] * (n - 1)).astype(int)
+        out[mask_mid] = sorted_vals[idx]
+        # Left tail
+        mask_left = q < (1 - qL)
+        p_exceed = (1 - qL)
+        u = q[mask_left] / p_exceed
+        out[mask_left] = - (thL + gpd_ppf(1 - u, shapeL, scaleL))
+        # Right tail
+        mask_right = q > qU
+        p_exceed_r = (1 - qU)
+        u = (1 - q[mask_right]) / p_exceed_r
+        out[mask_right] = thR + gpd_ppf(1 - u, shapeR, scaleR)
+        return out
     return ppf
 
 
 # Hàm load dữ liệu và mô hình đã fit
-
-def load_copula_and_marginals(copula_path, std_resids_path):
+def load_copula_and_marginals(copula_path, std_resids_path, evt_param_path):
     """
     Load copula model và tạo dict các marginal quantile function từ standardized residuals.
+    Luôn dùng hybrid_ppf với tham số EVT, chỉ hỗ trợ file .pkl cho evt_param_path.
     """
-    # If loading a pyvinecopulib R-vine model, use from_json
     if copula_path.endswith('.json'):
-        # Đọc nội dung JSON từ file rồi mới parse
         with open(copula_path, 'r', encoding='utf-8') as f:
             json_str = f.read()
         best_copula_model = pv.Vinecop.from_json(json_str)
@@ -73,7 +96,14 @@ def load_copula_and_marginals(copula_path, std_resids_path):
         with open(copula_path, 'rb') as f:
             best_copula_model = pickle.load(f)
     std_resids_df = pd.read_csv(std_resids_path, index_col=0)
-    marginals = {col: empirical_ppf(std_resids_df[col].dropna().values) for col in std_resids_df.columns}
+    with open(evt_param_path, 'rb') as f:
+        evt_params = pickle.load(f)
+    marginals = {}
+    for col in std_resids_df.columns:
+        sample = std_resids_df[col].dropna().values
+        left = evt_params[col]['left']   # [thL, shapeL, scaleL]
+        right = evt_params[col]['right'] # [thR, shapeR, scaleR]
+        marginals[col] = hybrid_ppf(sample, left, right)
     return best_copula_model, marginals
 
 
@@ -200,13 +230,13 @@ def main():
     sim_parser = subparsers.add_parser('simulate', help='Simulate portfolio risk using fitted copula')
     sim_parser.add_argument('--copula', type=str, default='models/best_copula.json', help='Path to copula model pickle file')
     sim_parser.add_argument('--std_resids', type=str, default='data/processed/std_resids.csv', help='Path to standardized residuals CSV')
+    sim_parser.add_argument('--evt_params', type=str, required=True, help='Path to EVT params JSON file')
     sim_parser.add_argument('--n_sim', type=int, default=10000, help='Number of simulations')
     sim_parser.add_argument('--output', type=str, default='data/processed/simulated_copula_samples.csv', help='Output CSV file for simulated samples')
 
     # Subparser for fitting copula
     fit_parser = subparsers.add_parser('fit', help='Fit copula model and save to pickle')
     fit_parser.add_argument('--std_resids', type=str, default='data/processed/std_resids.csv', help='Path to standardized residuals CSV')
-    fit_parser.add_argument('--copula_type', type=str, default='vine_student', choices=['vine_student','vine_gaussian','gaussian','clayton','gumbel','rvine'], help='Type of copula to fit (vine_student, vine_gaussian, gaussian, clayton, gumbel, rvine)')
     fit_parser.add_argument('--output', type=str, default='models/best_copula.json', help='Output path for copula JSON')
 
     # Subparser for analysis
@@ -219,18 +249,18 @@ def main():
     args = parser.parse_args()
 
     if args.command == 'fit':
-        fit_copula_and_save(args.std_resids, args.copula_type, args.output)
+        fit_copula_and_save(args.std_resids, args.output)
     elif args.command == 'simulate':
         print(f"Loading copula model from: {args.copula}")
         print(f"Loading standardized residuals from: {args.std_resids}")
-        best_copula_model, marginals = load_copula_and_marginals(args.copula, args.std_resids)
+        print(f"Loading EVT params from: {args.evt_params}")
+        best_copula_model, marginals = load_copula_and_marginals(args.copula, args.std_resids, args.evt_params)
         print(f"Simulating {args.n_sim} samples...")
         simulate_copula_portfolio(best_copula_model, marginals, n_sim=args.n_sim, output_path=args.output)
     elif args.command == 'analyze':
         comprehensive_analysis(args.sim_csv, real_csv_path=args.real_csv, alpha=args.alpha, out_dir=args.out_dir)
     else:
         parser.print_help()
-
 
 if __name__ == "__main__":
     main()
