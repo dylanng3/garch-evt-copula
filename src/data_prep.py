@@ -6,49 +6,106 @@ import numpy as np
 from typing import List, Optional
 
 
-def load_multiple_csv_to_df(folder_path: str, dropna_type: str = 'any', min_non_na: Optional[int] = None) -> pd.DataFrame:
+def load_split_adjusted_data(folder_path: str, dropna_type: str = 'any', min_non_na: Optional[int] = None) -> pd.DataFrame:
     """
-    Load and merge all single-ticker CSV files in a folder into one DataFrame.
-    dropna_type: 'any' (default, intersection), 'all' (union), or set min_non_na for at least n non-NA values per row.
+    Load and merge ALL split-adjusted CSV files from Download Data pattern.
+    Merge all years for each ticker to get complete time series.
     """
-    dfs = []
-    for file in os.listdir(folder_path):
-        if not file.endswith('.csv'):
-            continue
-        ticker = os.path.splitext(file)[0].upper()
-        df = pd.read_csv(os.path.join(folder_path, file))
-        date_col = next((c for c in df.columns if c.strip().lower() in ['date', 'ngay', 'time', 'datetime']), df.columns[0])
-        price_col = next((c for c in df.columns if c.lower() in ['close', ticker, ticker+'.VN', ticker+'.HO', ticker+'.HM']), df.columns[1])
-        df = df[[date_col, price_col]].rename(columns={date_col: 'Date', price_col: ticker})
-        df['Date'] = pd.to_datetime(df['Date'], dayfirst=True, errors='coerce')
-        # Remove commas and quotes, then convert to float
-        df[ticker] = (
-            df[ticker]
-            .astype(str)
-            .str.replace(',', '', regex=False)
-            .str.replace('"', '', regex=False)
-        )
-        df[ticker] = pd.to_numeric(df[ticker], errors='coerce')
-        df = df.set_index('Date').sort_index()
-        dfs.append(df)
-    if not dfs:
-        raise ValueError("No data loaded from CSV files.")
-    merged = pd.concat(dfs, axis=1).sort_index()
-    merged = merged.apply(pd.to_numeric, errors='coerce')
-    if min_non_na is not None:
-        merged = merged.dropna(thresh=min_non_na)
-    else:
-        # Only allow 'any' or 'all' for dropna(how=...)
-        how = 'any' if dropna_type != 'all' else 'all'
-        merged = merged.dropna(how=how)
-    return merged
+    print(f"Loading split-adjusted data from {folder_path}...")
+    
+    # Get all Download Data files
+    csv_files = [f for f in os.listdir(folder_path) 
+                 if f.endswith('.csv') and f.startswith('Download Data - STOCK_VN_XSTC_')]
+    
+    if not csv_files:
+        raise ValueError(f"No 'Download Data - STOCK_VN_XSTC_*' files found in {folder_path}")
+    
+    print(f"Found {len(csv_files)} files to process")
+    
+    # Group files by ticker
+    ticker_files = {}
+    for file in csv_files:
+        # Extract ticker: Download Data - STOCK_VN_XSTC_FPT (1).csv → FPT
+        parts = file.replace('Download Data - STOCK_VN_XSTC_', '').replace('.csv', '')
+        ticker = parts.split(' ')[0].split('(')[0].split('_')[0].split('-')[0].strip()
+        
+        if ticker not in ticker_files:
+            ticker_files[ticker] = []
+        ticker_files[ticker].append(file)
+    
+    print(f"Grouped into {len(ticker_files)} tickers: {list(ticker_files.keys())}")
+    
+    # Process each ticker separately
+    ticker_dfs = {}
+    for ticker, files in ticker_files.items():
+        print(f"\nProcessing {ticker} ({len(files)} files)...")
+        yearly_data = []
+        for file in sorted(files):  # Sort files for consistent processing
+            file_path = os.path.join(folder_path, file)
+            try:
+                df = pd.read_csv(file_path)
+                # Find date and price columns
+                date_col = next((c for c in df.columns if c.strip().lower() in ['date', 'ngay']), df.columns[0])
+                price_col = next((c for c in df.columns if c.lower() in ['close', 'price']), 
+                                next((c for c in df.columns if 'price' in c.lower()), df.columns[1]))
+                # Clean and convert
+                df[date_col] = pd.to_datetime(df[date_col], dayfirst=True, errors='coerce')
+                df[price_col] = (
+                    df[price_col]
+                    .astype(str)
+                    .str.replace(',', '', regex=False)
+                    .str.replace('"', '', regex=False)
+                )
+                df[price_col] = pd.to_numeric(df[price_col], errors='coerce')
+                # Create clean dataframe
+                df_clean = df[[date_col, price_col]].dropna().set_index(date_col).sort_index()
+                df_clean.columns = [f"{ticker}_DATA"]
+                if len(df_clean) > 0:
+                    yearly_data.append(df_clean)
+                    print(f"  {file}: {len(df_clean)} records, {df_clean.index.min()} to {df_clean.index.max()}")
+            except Exception as e:
+                print(f"  Error processing {file}: {e}")
+                continue
+        if yearly_data:
+            # Merge all years for this ticker
+            ticker_merged = pd.concat(yearly_data, axis=0).sort_index()
+            # Remove duplicates (keep last = most recent data)
+            if ticker_merged.index.duplicated().any():
+                dup_count = ticker_merged.index.duplicated().sum()
+                ticker_merged = ticker_merged[~ticker_merged.index.duplicated(keep='last')]
+                print(f"  {ticker}: Removed {dup_count} duplicate dates")
+            ticker_dfs[ticker] = ticker_merged
+            print(f"  {ticker}: Final shape {ticker_merged.shape}")
+        else:
+            print(f"  {ticker}: No valid data found")
+    
+    if not ticker_dfs:
+        raise ValueError("No valid ticker data loaded")
+    
+    # Combine all tickers
+    print(f"\nCombining {len(ticker_dfs)} tickers...")
+    final_df = pd.concat(list(ticker_dfs.values()), axis=1).sort_index()
+    
+    # More flexible dropna - keep rows with at least half the tickers
+    min_tickers = max(1, len(ticker_dfs) // 2)
+    original_len = len(final_df)
+    final_df = final_df.dropna(thresh=min_tickers)
+    
+    print(f"Applied flexible dropna (thresh={min_tickers}): {original_len} -> {len(final_df)} rows")
+    print(f"Final shape: {final_df.shape}")
+    
+    if len(final_df) > 0:
+        print(f"Date range: {final_df.index.min()} to {final_df.index.max()}")
+        print(f"Columns: {list(final_df.columns)}")
+    
+    return final_df
 """
 Module: data_prep.py
 Description: Utility functions for downloading, cleaning, and saving data for the GARCH-EVT-Copula project.
 """
 
 def check_negative_or_zero(price_df: pd.DataFrame) -> pd.DataFrame:
-    """Remove rows with any closing price <= 0."""
+    """Remove rows with any closing price less than or equal to 0."""
     mask = (price_df <= 0).any(axis=1)
     if mask.sum() > 0:
         print(f"{mask.sum()} days have closing price <= 0 and will be removed.")
@@ -78,34 +135,51 @@ def save_to_csv(df: pd.DataFrame, path: str):
     """Save DataFrame to CSV file."""
     df.to_csv(path)
 
-def main_data_prep(raw_folder: str, processed_folder: str, dropna_type: str = 'any', min_non_na: Optional[int] = None):
+def main_split_adjusted_prep(raw_folder: str, processed_folder: str, dropna_type: str = 'any', min_non_na: Optional[int] = None):
     """
-    Run the full data preparation pipeline: load, clean, check, and save processed data.
+    Run data preparation pipeline for split-adjusted data (yearly CSV files).
     """
-    print("Loading and merging raw data...")
-    data = load_multiple_csv_to_df(raw_folder, dropna_type=dropna_type, min_non_na=min_non_na)
-    print(f"Data shape after merge: {data.shape}")
-    # Remove rows with closing price <= 0
+    print("=== SPLIT-ADJUSTED DATA PREPARATION ===")
+    
+    # Create processed folder if it does not exist
+    os.makedirs(processed_folder, exist_ok=True)
+    
+    # Load split-adjusted data
+    data = load_split_adjusted_data(raw_folder, dropna_type=dropna_type, min_non_na=min_non_na)
+    
+    # Remove rows with closing price less than or equal to 0
     data = check_negative_or_zero(data)
     print(f"Data shape after removing <=0: {data.shape}")
+    
     # Check missing values
     report_missing_values(data)
+    
     # Save cleaned price data
     price_path = os.path.join(processed_folder, 'price_cleaned.csv')
     save_to_csv(data, price_path)
     print(f"Saved cleaned price data to {price_path}")
+    
     # Compute log returns
     log_returns = compute_log_returns(data)
+    
     # Round to 6 decimals for readability
     log_returns = log_returns.round(6)
     logret_path = os.path.join(processed_folder, 'log_returns.csv')
     save_to_csv(log_returns, logret_path)
     print(f"Saved log returns to {logret_path}")
+    
     # Save the original date index 
     logret_index_path = os.path.join(processed_folder, 'log_returns_index.csv')
     log_returns.index.to_series().to_csv(logret_index_path, header=True)
     print(f"Saved log returns index to {logret_index_path}")
-    print("Data preparation pipeline completed.")
+    
+    # Quick check for remaining extreme outliers
+    outliers = check_outliers(log_returns, threshold=0.15)
+    if not outliers.empty:
+        print(f"\nStill found {len(outliers)} potential outliers > 15%:")
+        print(outliers.abs().max().sort_values(ascending=False))
+    
+    print("Split-adjusted data preparation completed.")
     
     # Add CLI entry point
 if __name__ == "__main__":
@@ -116,7 +190,8 @@ if __name__ == "__main__":
     parser.add_argument('--dropna_type', type=str, default='any', choices=['any', 'all'], help="Row filter: 'any' (intersection) or 'all' (union)")
     parser.add_argument('--min_non_na', type=int, default=None, help='Minimum non-NA values per row (overrides dropna_type if set)')
     args = parser.parse_args()
-    main_data_prep(
+    
+    main_split_adjusted_prep(
         raw_folder=args.raw_folder,
         processed_folder=args.processed_folder,
         dropna_type=args.dropna_type,
