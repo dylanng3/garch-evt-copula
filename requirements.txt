@@ -15,4 +15,5 @@ scipy
 seaborn
 statsmodels
 tqdm
+pymc
 -e .
