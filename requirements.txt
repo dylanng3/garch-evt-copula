@@ -12,4 +12,5 @@ pyvinecopulib
 ruff
 seaborn
 tqdm
+pymc
 -e .
