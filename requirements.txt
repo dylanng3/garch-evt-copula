@@ -10,6 +10,9 @@ pytest
 python-dotenv
 pyvinecopulib
 ruff
+scikit-learn
+scipy
 seaborn
+statsmodels
 tqdm
 -e .

@@ -1,0 +1,18 @@
+{
+  "evt_ready_tickers": [
+    "FPT_DATA",
+    "HPG_DATA",
+    "MBB_DATA",
+    "MWG_DATA"
+  ],
+  "ks_results": {
+    "FPT_DATA": 0.2751599805101803,
+    "HPG_DATA": 0.19982246060117947,
+    "MBB_DATA": 0.0251294775929245,
+    "MWG_DATA": 0.23263103794802642,
+    "VIC_DATA": 0.0006825283656621548
+  },
+  "improved_models": {},
+  "total_models": 5,
+  "success_rate": 0.8
+}

@@ -1,0 +1,11 @@
+Ticker,Side,Current_Quality,Suggestions
+FPT_DATA,left,Poor,"📊 Check data quality (outliers, structural breaks); 🏗️ Try Peaks-over-Threshold with different u"
+FPT_DATA,right,Poor,"📊 Check data quality (outliers, structural breaks); 🏗️ Try Peaks-over-Threshold with different u"
+HPG_DATA,left,Poor,"📊 Check data quality (outliers, structural breaks); 🏗️ Try Peaks-over-Threshold with different u"
+HPG_DATA,right,Poor,"📊 Check data quality (outliers, structural breaks); 🏗️ Try Peaks-over-Threshold with different u"
+MBB_DATA,left,Poor,"📊 Check data quality (outliers, structural breaks); 🏗️ Try Peaks-over-Threshold with different u"
+MBB_DATA,right,Poor,"📊 Check data quality (outliers, structural breaks); 🏗️ Try Peaks-over-Threshold with different u"
+MWG_DATA,left,Poor,"📊 Check data quality (outliers, structural breaks); 🏗️ Try Peaks-over-Threshold with different u"
+MWG_DATA,right,Poor,"📊 Check data quality (outliers, structural breaks); 🏗️ Try Peaks-over-Threshold with different u"
+VIC_DATA,left,Poor,"📊 Check data quality (outliers, structural breaks); 🏗️ Try Peaks-over-Threshold with different u"
+VIC_DATA,right,Poor,"📊 Check data quality (outliers, structural breaks); 🏗️ Try Peaks-over-Threshold with different u"
