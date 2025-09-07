@@ -1,0 +1,6 @@
+ticker,omega,alpha,beta,gamma,persistence,half_life,persistence_status,asymmetric_effect
+FPT_DATA,-0.2578,0.2241,0.9662,0.0,0.9662,20.2,Moderate,Weak
+HPG_DATA,-0.4047,0.2771,0.9459,0.0,0.9459,12.5,Low,Weak
+MBB_DATA,-0.1724,0.2465,0.9758,0.0,0.9758,28.3,Moderate,Weak
+MWG_DATA,-0.3125,0.2587,0.9558,0.0,0.9558,15.3,Moderate,Weak
+VIC_DATA,-0.0522,1.2037,0.9027,0.0,0.9027,6.8,Low,Weak

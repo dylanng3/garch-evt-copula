@@ -1,0 +1,6 @@
+ticker,sign_bias_p,neg_size_bias_p,pos_size_bias_p,joint_f_p,significant_effects,status
+FPT_DATA,0.4382,0.321,0.0302,0.1427,1,NO
+HPG_DATA,0.4918,0.0852,0.0245,0.0354,1,MODERATE
+MBB_DATA,0.4058,0.2021,0.4678,0.6315,0,NO
+MWG_DATA,0.2863,0.0048,0.0511,0.0104,1,MODERATE
+VIC_DATA,0.2339,0.235,0.6947,0.5724,0,NO
