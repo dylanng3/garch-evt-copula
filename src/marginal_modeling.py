@@ -8,8 +8,10 @@ from statsmodels.tsa.statespace.sarimax import SARIMAX
 from statsmodels.stats.diagnostic import acorr_ljungbox, het_arch
 import statsmodels.api as sm
 from arch import arch_model
-from scipy.stats import genpareto
+from scipy.stats import genpareto, kstest
 from sklearn.neighbors import KernelDensity
+import matplotlib.pyplot as plt
+import math
 
 def engle_ng_test(residuals):
     '''Engle-NG bias test - compact version'''
@@ -183,6 +185,7 @@ def process_ticker(ticker, returns):
         model_name = selected['model_name']
         arima_aic = selected['arima_model'].aic
         garch_aic = selected['aic']
+        
         print(f'   {ticker}: {model_name} | ARIMA AIC={arima_aic:.2f}, GARCH AIC={garch_aic:.2f}')
         
         # Compact diagnostic display
@@ -236,46 +239,6 @@ def fit_evt_marginal(std_resids, tail_prob=0.1):
         'tail_prob': tail_prob
     }
 
-def semiparametric_cdf(x, marginal):
-    '''Semi-parametric CDF evaluation for copula transformation'''
-    x = np.atleast_1d(x)
-    cdf_vals = np.zeros_like(x, dtype=float)
-    
-    upper_thresh = marginal['threshold_info']['upper_threshold']
-    lower_thresh = marginal['threshold_info']['lower_threshold']
-    tail_prob = marginal['tail_prob']
-    
-    # Lower tail GPD
-    lower_mask = x < lower_thresh
-    if np.any(lower_mask) and marginal['lower_tail_gpd']:
-        gpd = marginal['lower_tail_gpd']
-        exc = lower_thresh - x[lower_mask]
-        if gpd['shape'] != 0:
-            tail_cdf = (1 + gpd['shape'] * exc / gpd['scale']) ** (-1/gpd['shape'])
-        else:
-            tail_cdf = np.exp(-exc / gpd['scale'])
-        cdf_vals[lower_mask] = tail_prob * (1 - tail_cdf)
-    
-    # Center empirical CDF
-    center_mask = (x >= lower_thresh) & (x <= upper_thresh)
-    if np.any(center_mask):
-        center_data = marginal['center_kde']['center_data']
-        for i, xi in enumerate(x[center_mask]):
-            empirical_cdf = np.mean(center_data <= xi)
-            cdf_vals[center_mask][i] = tail_prob + (1-2*tail_prob) * empirical_cdf
-    
-    # Upper tail GPD
-    upper_mask = x > upper_thresh
-    if np.any(upper_mask) and marginal['upper_tail_gpd']:
-        gpd = marginal['upper_tail_gpd']
-        exc = x[upper_mask] - upper_thresh
-        if gpd['shape'] != 0:
-            tail_cdf = (1 + gpd['shape'] * exc / gpd['scale']) ** (-1/gpd['shape'])
-        else:
-            tail_cdf = np.exp(-exc / gpd['scale'])
-        cdf_vals[upper_mask] = 1 - tail_prob * tail_cdf
-    
-    return cdf_vals[0] if len(cdf_vals) == 1 else cdf_vals
 
 if __name__ == '__main__':
     # Load data
@@ -395,6 +358,7 @@ if __name__ == '__main__':
         model_name = result.get('model_name', 'Unknown')
         model_counts[model_name] = model_counts.get(model_name, 0) + 1
     
+    print("📈 GARCH Model Distribution:")
     for model, count in sorted(model_counts.items(), key=lambda x: x[1], reverse=True):
         print(f"   • {model}: {count} ticker(s)")
     
@@ -404,3 +368,433 @@ if __name__ == '__main__':
     
     print(f"\n📈 Overall Success Rate: {passing_models}/{len(garch_results)} ({success_rate:.1f}%) models passed all diagnostics")
     print('='*80)
+
+
+# Functions for EVT diagnostics and plotting
+def fit_gpd_tails(z, tail_prob=0.10):
+    z = np.asarray(z, float)
+    z = z[np.isfinite(z)]
+    lo = np.nanpercentile(z, tail_prob*100)
+    hi = np.nanpercentile(z, (1-tail_prob)*100)
+
+    exc_u = z[z>hi] - hi                   # upper exceedances
+    exc_l = lo - z[z<lo]                   # lower exceedances (make positive)
+
+    # Fit GPD (loc fixed at 0)
+    xi_u, _, beta_u = genpareto.fit(exc_u, floc=0)
+    xi_l, _, beta_l = genpareto.fit(exc_l, floc=0)
+
+    return {"thr": (lo, hi),
+            "upper": {"xi": xi_u, "beta": beta_u, "Nu": exc_u.size},
+            "lower": {"xi": xi_l, "beta": beta_l, "Nl": exc_l.size},
+            "tail_prob": tail_prob}
+
+def gpd_tail_plots(z, gpd, ax_hist=None, ax_qq=None, ax_pp=None, bins=50):
+    z = np.asarray(z, float); z = z[np.isfinite(z)]
+    lo, hi = gpd["thr"]; p = gpd["tail_prob"]
+    exc_u = z[z>hi] - hi; exc_l = lo - z[z<lo]
+
+    # 1) Histogram + GPD tail density overlay
+    if ax_hist is not None:
+        counts, bins_, patches = ax_hist.hist(z, bins=bins, density=True, alpha=0.9, edgecolor='none')
+        # Recolor tail bars
+        centers = 0.5*(bins_[:-1]+bins_[1:])
+        for c, bc, patch in zip(counts, centers, patches):
+            if bc <= lo or bc >= hi:
+                patch.set_facecolor('orange'); patch.set_alpha(0.6)
+        ax_hist.axvline(lo, color='red', ls='--', lw=1); ax_hist.axvline(hi, color='red', ls='--', lw=1)
+        ax_hist.set_title(f"Tails p={p:.2f} | Nu⁺={gpd['upper']['Nu']} Nu⁻={gpd['lower']['Nl']}")
+        ax_hist.set_xlabel("Std. residuals"); ax_hist.set_ylabel("Density"); ax_hist.grid(alpha=0.3)
+
+    # 2) QQ plot for exceedances vs GPD
+    if ax_qq is not None:
+        for exc, side, pars in [(exc_l,"Lower",gpd["lower"]), (exc_u,"Upper",gpd["upper"])]:
+            if exc.size >= 5:
+                qs = np.linspace(0.05, 0.95, exc.size)
+                theo = genpareto.ppf(qs, c=pars["xi"], loc=0, scale=pars["beta"])
+                samp = np.quantile(exc, qs)
+                ax_qq.scatter(theo, samp, s=14, alpha=0.7, label=f"{side} ({exc.size})")
+        ax_qq.plot([0, max(ax_qq.get_xlim()[1], ax_qq.get_ylim()[1])],
+                   [0, max(ax_qq.get_xlim()[1], ax_qq.get_ylim()[1])], 'k--', lw=1)
+        ax_qq.set_title("GPD QQ (exceedances)"); ax_qq.set_xlabel("Theoretical"); ax_qq.set_ylabel("Sample")
+        ax_qq.legend(); ax_qq.grid(alpha=0.3)
+
+    # 3) PP plot (empirical CDF vs GPD CDF)
+    if ax_pp is not None:
+        for exc, side, pars in [(exc_l,"Lower",gpd["lower"]), (exc_u,"Upper",gpd["upper"])]:
+            if exc.size >= 5:
+                s = np.sort(exc); emp = np.arange(1, len(s)+1)/(len(s)+1)
+                mod = genpareto.cdf(s, c=pars["xi"], loc=0, scale=pars["beta"])
+                ax_pp.plot(mod, emp, '.', ms=4, label=f"{side} ({len(s)})")
+        ax_pp.plot([0,1],[0,1],'k--',lw=1); ax_pp.set_xlim(0,1); ax_pp.set_ylim(0,1)
+        ax_pp.set_title("GPD PP (exceedances)"); ax_pp.set_xlabel("Model CDF"); ax_pp.set_ylabel("Empirical")
+        ax_pp.legend(); ax_pp.grid(alpha=0.3)
+
+def gpd_tail_tests(z, gpd):
+    z = np.asarray(z, float); z = z[np.isfinite(z)]
+    lo, hi = gpd["thr"]
+    exc_u = z[z>hi] - hi; exc_l = lo - z[z<lo]
+    out = {}
+    # KS trên exceedances: so sánh với GPD(ξ,β)
+    if exc_u.size >= 5:
+        out["KS_upper_p"] = kstest(exc_u, lambda x: genpareto.cdf(x, c=gpd["upper"]["xi"], loc=0, scale=gpd["upper"]["beta"])).pvalue
+    if exc_l.size >= 5:
+        out["KS_lower_p"] = kstest(exc_l, lambda x: genpareto.cdf(x, c=gpd["lower"]["xi"], loc=0, scale=gpd["lower"]["beta"])).pvalue
+    return out
+
+
+# ==================== EVT utilities & plots (functions) ====================
+from matplotlib.lines import Line2D
+
+# ---- core: compute tail stats for one series ----
+def tail_stats(z, p_grid=(0.15,0.12,0.10,0.08,0.06,0.05), min_n=30):
+    """
+    Return DataFrame with columns:
+    p, uL, uU, ME_L, ME_U, xi_L, xi_U, beta_L, beta_U, Nu_L, Nu_U, KS_L, KS_U
+    """
+    z = np.asarray(z, float)
+    z = z[np.isfinite(z)]
+    out = {k: [] for k in ["p","uL","uU","ME_L","ME_U",
+                           "xi_L","xi_U","beta_L","beta_U",
+                           "Nu_L","Nu_U","KS_L","KS_U"]}
+    for p in p_grid:
+        uL = np.nanpercentile(z, p*100)
+        uU = np.nanpercentile(z, (1-p)*100)
+        excU = z[z > uU] - uU         # upper exceedances
+        excL = uL - z[z < uL]         # lower exceedances (>=0)
+
+        ME_U = float(np.mean(excU)) if excU.size else np.nan
+        ME_L = float(np.mean(excL)) if excL.size else np.nan
+
+        xiU = betaU = KSU = np.nan
+        xiL = betaL = KSL = np.nan
+        if excU.size >= min_n:
+            xiU, _, betaU = genpareto.fit(excU, floc=0)
+            KSU = kstest(excU, lambda x: genpareto.cdf(x, c=xiU, loc=0, scale=betaU)).pvalue
+        if excL.size >= min_n:
+            xiL, _, betaL = genpareto.fit(excL, floc=0)
+            KSL = kstest(excL, lambda x: genpareto.cdf(x, c=xiL, loc=0, scale=betaL)).pvalue
+
+        row_vals = [p,uL,uU,ME_L,ME_U,xiL,xiU,betaL,betaU,
+                    int(excL.size),int(excU.size),KSL,KSU]
+        for k,v in zip(out.keys(), row_vals):
+            out[k].append(v)
+    return pd.DataFrame(out)
+
+# ---- plot 1: Mean-Excess grid ----
+def plot_mean_excess_grid(
+    data_dict,
+    p_grid=(0.15,0.12,0.10,0.08,0.06,0.05),
+    min_n=30,
+    cols=3,
+    annotate=True,
+    annotate_rows=(0,),
+    suptitle="EVT – Mean-Excess Plots"
+):
+    tickers = list(data_dict.keys())
+    rows = math.ceil(len(tickers)/cols)
+    fig, axes = plt.subplots(rows, cols, figsize=(6*cols, 4*rows))
+    axes = np.atleast_1d(axes).ravel()
+    fig.suptitle(suptitle, fontsize=14, y=0.995)
+
+    for i, t in enumerate(tickers):
+        df = tail_stats(data_dict[t], p_grid=p_grid, min_n=min_n)
+        ax = axes[i]
+        ax.plot(df["uL"], df["ME_L"], "o-", lw=1.8, ms=4, color="C0", label="Lower ME(u)")
+        ax.plot(df["uU"], df["ME_U"], "o-", lw=1.8, ms=4, color="C1", label="Upper ME(u)")
+        ax.set_title(t, fontsize=11)
+        ax.set_xlabel("Threshold u"); ax.set_ylabel("ME(u)")
+        ax.grid(alpha=0.25); [sp.set_alpha(0.3) for sp in ax.spines.values()]
+        ax.tick_params(labelsize=9)
+
+        if annotate and (i in set(annotate_rows)):
+            for p0, yoff in [(0.10, 0.96), (0.05, 0.86)]:
+                if p0 in df["p"].values:
+                    r = df.loc[df["p"]==p0].iloc[0]
+                    ks_l = f"{r['KS_L']:.3f}" if pd.notna(r['KS_L']) else "nan"
+                    ks_u = f"{r['KS_U']:.3f}" if pd.notna(r['KS_U']) else "nan"
+                    txt = f"p={p0:.2f}: Nu±=({r['Nu_L']},{r['Nu_U']}) | KS±=({ks_l},{ks_u})"
+                    ax.text(0.02, yoff, txt, transform=ax.transAxes, va="top",
+                            bbox=dict(boxstyle="round", fc="white", alpha=0.9), fontsize=8)
+
+    # hide unused panes
+    for j in range(i+1, len(axes)): axes[j].axis('off')
+
+    # global legend
+    proxies = [
+        Line2D([0],[0], color="C0", marker="o", lw=1.8, ms=4, label="Lower ME(u)"),
+        Line2D([0],[0], color="C1", marker="o", lw=1.8, ms=4, label="Upper ME(u)"),
+    ]
+    fig.legend(proxies, [p.get_label() for p in proxies], # type: ignore
+               loc="lower center", ncol=2, frameon=False, fontsize=9, bbox_to_anchor=(0.5, -0.02))
+    plt.tight_layout(); plt.show()
+
+# ---- plot 2: Parameter Stability grid (xi & beta vs p) ----
+def plot_parameter_stability_grid(
+    data_dict,
+    p_grid=(0.15,0.12,0.10,0.08,0.06,0.05),
+    min_n=30,
+    cols=3,
+    suptitle="EVT – Parameter Stability (xi & beta vs p)"
+):
+    tickers = list(data_dict.keys())
+    n = len(tickers)
+    rows = math.ceil(n/cols)
+    fig, axs = plt.subplots(rows, cols, figsize=(6*cols, 4*rows), constrained_layout=True)
+    fig.suptitle(suptitle, fontsize=14, y=0.995)
+
+    # normalize axs to 2D
+    if rows == 1: axs = np.atleast_2d(axs)
+
+    for i, t in enumerate(tickers):
+        df = tail_stats(data_dict[t], p_grid=p_grid, min_n=min_n)
+        r, c = divmod(i, cols)
+        ax = axs[r, c]; ax2 = ax.twinx()
+
+        name = t.replace("_DATA", "")
+        ax.set_title(name, fontsize=11)
+
+        # xi (left)
+        ax.plot(df["p"], df["xi_L"], "o-", lw=1.8, ms=4, color="#2ca02c", label="xi_lower")
+        ax.plot(df["p"], df["xi_U"], "o-", lw=1.8, ms=4, color="#d62728", label="xi_upper")
+        ax.set_xlabel("Tail mass p"); ax.set_ylabel("xi", color="#2ca02c")
+        ax.tick_params(axis='y', labelcolor="#2ca02c", labelsize=9)
+        ax.set_xticks(p_grid); ax.set_xticklabels([f"{p:.2f}" for p in p_grid], fontsize=9)
+        ax.invert_xaxis(); ax.grid(alpha=0.25)
+        [sp.set_alpha(0.3) for sp in ax.spines.values()]
+
+        # beta (right)
+        ax2.plot(df["p"], df["beta_L"], "s--", lw=1.6, ms=4, color="#9467bd", label="beta_lower")
+        ax2.plot(df["p"], df["beta_U"], "s--", lw=1.6, ms=4, color="#8c564b", label="beta_upper")
+        ax2.set_ylabel("beta", color="#9467bd"); ax2.tick_params(axis='y', labelcolor="#9467bd", labelsize=9)
+        [sp.set_alpha(0.3) for sp in ax2.spines.values()]
+
+    # hide unused panes
+    total = rows*cols
+    for j in range(n, total):
+        r, c = divmod(j, cols)
+        axs[r, c].axis('off')
+
+    # global legend (proxies)
+    proxies = [
+        Line2D([0],[0], color="#2ca02c", marker="o", lw=1.8, ms=4, label="xi_lower"),
+        Line2D([0],[0], color="#d62728", marker="o", lw=1.8, ms=4, label="xi_upper"),
+        Line2D([0],[0], color="#9467bd", marker="s", lw=1.6, ms=4, ls="--", label="beta_lower"),
+        Line2D([0],[0], color="#8c564b", marker="s", lw=1.6, ms=4, ls="--", label="beta_upper"),
+    ]
+    fig.legend(proxies, [p.get_label() for p in proxies], # type: ignore
+               loc="lower center", ncol=4, frameon=False, fontsize=9, bbox_to_anchor=(0.5, -0.02))
+    plt.subplots_adjust(bottom=0.08)
+    plt.tight_layout(); plt.show()
+
+
+def semiparametric_cdf(z, x=None, p=0.10, min_exc=30, eps=1e-12, evt_marginal=None):
+    """
+    Semi-parametric CDF: core ECDF in [uL,uU], GPD in tails.
+    Ensures continuity at uL/uU and numerical stability.
+    
+    Parameters:
+    -----------
+    z : array-like
+        Standardized residuals data
+    x : array-like, optional
+        Points at which to evaluate the CDF. If None, uses z values themselves
+    p : float, default 0.10
+        Tail probability threshold (only used if evt_marginal is None)
+    min_exc : int, default 30
+        Minimum exceedances for GPD fitting (only used if evt_marginal is None)
+    eps : float, default 1e-12
+        Numerical safety clipping
+    evt_marginal : dict, optional
+        Pre-fitted EVT marginal. If provided, uses its parameters instead of fitting new GPD
+        
+    Returns:
+    --------
+    array : CDF values at points x
+    """
+    z = np.asarray(z, float)
+    z = z[np.isfinite(z)]
+    if z.size == 0:
+        return np.array([])
+
+    if x is None:
+        x = z
+    x = np.asarray(x, float)
+
+    # If evt_marginal is provided, use its parameters
+    if evt_marginal is not None:
+        p = evt_marginal['tail_prob']
+        upper_gpd = evt_marginal['upper_tail_gpd']
+        lower_gpd = evt_marginal['lower_tail_gpd']
+        
+        if upper_gpd is None or lower_gpd is None:
+            # Fallback to empirical CDF if GPD fitting failed
+            z_sorted = np.sort(z)
+            return np.clip(np.searchsorted(z_sorted, x, side='right') / len(z_sorted), eps, 1.0 - eps)
+        
+        uL = lower_gpd['threshold']
+        uU = upper_gpd['threshold']
+        xiL = lower_gpd['shape']
+        betaL = lower_gpd['scale']
+        xiU = upper_gpd['shape'] 
+        betaU = upper_gpd['scale']
+        
+        # Center data for ECDF
+        center_data = evt_marginal['center_kde']['center_data']
+        center_sorted = np.sort(center_data)
+        def ecdf_center(x_vals):
+            return np.searchsorted(center_sorted, x_vals, side="right") / max(1, len(center_sorted))
+        
+        # Compute CDF values
+        F = np.empty_like(x)
+        
+        # Lower tail
+        idxL = x < uL
+        y = uL - x[idxL]
+        HL = genpareto.cdf(y, c=xiL, loc=0, scale=betaL)
+        F[idxL] = p * (1 - HL)
+        
+        # Center
+        idxC = (x >= uL) & (x <= uU)
+        F[idxC] = p + (1 - 2*p) * ecdf_center(x[idxC])
+        
+        # Upper tail
+        idxU = x > uU
+        y = x[idxU] - uU
+        HU = genpareto.cdf(y, c=xiU, loc=0, scale=betaU)
+        F[idxU] = 1 - p + p * HU
+        
+        return np.clip(F, eps, 1.0 - eps)
+    
+    # Original logic: fit GPD ourselves
+    assert 0.0 < p < 0.5, "p should be in (0, 0.5)"
+
+    # thresholds
+    uL = np.nanpercentile(z, p*100)
+    uU = np.nanpercentile(z, (1-p)*100)
+
+    # split data
+    maskL = z < uL
+    maskU = z > uU
+    maskC = ~maskL & ~maskU
+    zC = z[maskC]
+
+    # ECDF in core (use 'left' to make F(uL)=p)
+    zC_sorted = np.sort(zC)
+    def ecdf_core(x_vals):
+        # fraction of core strictly < x
+        return np.searchsorted(zC_sorted, x_vals, side="left") / max(1, len(zC_sorted))
+
+    # GPD fits (exceedances)
+    excU = z[maskU] - uU                # right
+    excL = uL - z[maskL]                # left (on -X)
+    xiU = betaU = xiL = betaL = np.nan
+    if excU.size >= min_exc:
+        xiU, _, betaU = genpareto.fit(excU, floc=0.0)
+    if excL.size >= min_exc:
+        xiL, _, betaL = genpareto.fit(excL, floc=0.0)
+
+    F = np.empty_like(x, dtype=float)
+
+    # lower tail: x < uL  → F(x) = p * (1 - H_L(uL - x))
+    idxL = x < uL
+    if idxL.any():
+        if np.isfinite(xiL) and np.isfinite(betaL):
+            y = uL - x[idxL]
+            HL = genpareto.cdf(y, c=xiL, loc=0.0, scale=betaL)
+            F[idxL] = p * (1.0 - HL)
+        else:
+            # fallback empirical in left tail
+            if maskL.any():
+                L_sorted = np.sort(z[maskL])
+                F[idxL] = p * (np.searchsorted(L_sorted, x[idxL], side="right") / len(L_sorted))
+            else:
+                F[idxL] = 0.0
+
+    # core: uL <= x <= uU  → F(x) = p + (1-2p)*ECDF_core(x), with boundary fixes
+    idxC = (x >= uL) & (x <= uU)
+    if idxC.any():
+        Fc = p + (1.0 - 2.0 * p) * ecdf_core(x[idxC])
+        # enforce exact boundary values at thresholds for continuity
+        Fc = np.where(np.isclose(x[idxC], uL), p, Fc)
+        Fc = np.where(np.isclose(x[idxC], uU), 1.0 - p, Fc)
+        F[idxC] = Fc
+
+    # upper tail: x > uU  → F(x) = 1 - p + p * H_R(x - uU)
+    idxU = x > uU
+    if idxU.any():
+        if np.isfinite(xiU) and np.isfinite(betaU):
+            y = x[idxU] - uU
+            HU = genpareto.cdf(y, c=xiU, loc=0.0, scale=betaU)
+            F[idxU] = 1.0 - p + p * HU
+        else:
+            # fallback empirical in right tail
+            if maskU.any():
+                U_sorted = np.sort(z[maskU])
+                F[idxU] = 1.0 - p + p * (np.searchsorted(U_sorted, x[idxU], side="right") / len(U_sorted))
+            else:
+                F[idxU] = 1.0 - p
+
+    # numerical safety for copula input
+    return np.clip(F, eps, 1.0 - eps)
+
+
+def plot_semi_parametric_cdf(data_dict, p=0.10, min_exc=30, n_grid=400, pad=0.2):
+    """
+    Vẽ Empirical CDF vs. Semi-parametric CDF cho từng series trong data_dict
+    mà KHÔNG lặp lại bước fit EVT/GPD trong hàm plot.
+    """
+    print(f"SEMI-PARAMETRIC CDF PLOTS (p={p})")
+
+    tickers = list(data_dict.keys())
+    n = len(tickers)
+    if n == 0:
+        return
+
+    cols = 2
+    rows = math.ceil(n / cols)
+    fig, axes = plt.subplots(rows, cols, figsize=(cols * 6, rows * 4), squeeze=False)
+    axes = axes.ravel()
+
+    for i, tk in enumerate(tickers):
+        ax = axes[i]
+        z = np.asarray(data_dict[tk], float)
+        z = z[np.isfinite(z)]
+        if z.size == 0:
+            ax.set_axis_off()
+            continue
+
+        # Lưới x để vẽ CDF bán tham số
+        x_min, x_max = z.min() - pad, z.max() + pad
+        x_grid = np.linspace(x_min, x_max, n_grid)
+
+        # Semi-parametric CDF (gọi lại hàm có sẵn để tránh lặp code)
+        F_semi = semiparametric_cdf(z, x=x_grid, p=p, min_exc=min_exc)
+
+        # Empirical CDF
+        z_sorted = np.sort(z)
+        F_emp = np.arange(1, z_sorted.size + 1) / z_sorted.size
+
+        # Vẽ
+        ax.plot(z_sorted, F_emp, lw=2, alpha=0.85, label='Empirical CDF')
+        ax.plot(x_grid, F_semi, lw=2, alpha=0.95, label='Semi-parametric CDF')
+
+        # Vẽ ngưỡng để tham chiếu (chỉ tính 1 lần, không fit lại)
+        uL = np.nanpercentile(z, p * 100)
+        uU = np.nanpercentile(z, (1 - p) * 100)
+        ax.axvline(uL, ls='--', alpha=0.7)
+        ax.axvline(uU, ls='--', alpha=0.7)
+
+        ax.set_title(f"{tk} – Semi-parametric CDF (p={p:.2f})")
+        ax.set_xlabel("Standardized residuals")
+        ax.set_ylabel("Cumulative prob.")
+        ax.set_ylim(0, 1)
+        ax.grid(alpha=0.3)
+        ax.legend(fontsize=8)
+
+    # Ẩn các ô trống
+    for j in range(i + 1, rows * cols):
+        axes[j].set_axis_off()
+
+    plt.tight_layout()
+    plt.show()
