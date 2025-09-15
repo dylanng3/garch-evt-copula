@@ -116,21 +116,21 @@ Chạy notebooks theo thứ tự:
 
 ```python
 # 1. Data preparation
-from src.data_prep import load_data, clean_data, calculate_returns
+from src.data_prep import load_data, compute_log_returns
 price_data = load_data("data/raw")
-returns = calculate_returns(price_data)
+returns = compute_log_returns(price_data)
 
 # 2. Marginal modeling
-from src.marginal_modeling import fit_garch_evt_models
-models = fit_garch_evt_models(returns)
+from src.marginal_modeling import process_ticker
+models = process_ticker()
 
 # 3. Copula simulation
-from src.copula_simulation import fit_copula_and_simulate
-simulated_data = fit_copula_and_simulate()
+from src.copula_simulation import simulate_copula_portfolio
+simulated_data = simulate_copula_portfolio()
 
 # 4. Validation
-from src.validation import run_validation_pipeline
-validation_results = run_validation_pipeline()
+from src.validation import rolling_var_backtest
+rolling_var_backtest()
 ```
 
 ## 📊 Workflow Chi tiết
